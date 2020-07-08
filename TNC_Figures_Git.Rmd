@@ -1,0 +1,785 @@
+---
+title: "TNC Mouse Microarray Data"
+author: "AlexGW"
+date: "27/09/2019"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, message=FALSE, warning=FALSE, echo=TRUE, include=TRUE}
+
+setwd("~/Dropbox/POSTDOC/BioInformatics_Projects/TNC/Microarray_Data/bin/")
+
+library(readxl)
+library(tidyverse)
+library(pheatmap)
+library(gtools)
+library(ggfortify)
+
+# Load Reactome packages
+library(ReactomePA)
+library(org.Mm.eg.db)
+
+# Load packages to read gmt files and use the set_colnames fxn
+library(qusage)
+library(magrittr)
+
+# Load packages for limma analysis
+library(biomaRt)
+library(rtracklayer)
+library(GenomicFeatures)
+library(limma)
+
+mouseref_8v2 <- read.csv("../input/MouseRef-8_V2_0_R3_11278551_A.csv", sep= "\t", header = T, stringsAsFactors = F)
+
+## Need to read in raw ilmn data and work out which probe id's are to be included based on the base mean
+# see bioconductor post - https://support.bioconductor.org/p/43745/
+raw_limma <- read.ilmn("../input/microarray_raw_data.txt")
+
+raw_data <- read_xlsx("../input/microarray_data_median_norm.xlsx")
+mice_code <- tibble("Mice"=colnames(raw_data[2:17]),
+                    "Classification"= c("Lymph_Node", 
+                                        rep("Responder",5),
+                                        rep("Untreated", 5), 
+                                        rep("Non-Responder",5)))
+
+mice_code[1,1] <- "DTR LN"
+mice_code[3,1] <- "IT1"
+
+# check these match as there is a slight difference in names
+mice_code$Mice %>% sort()
+colnames(raw_limma$E) %>% sort()
+
+# run limma
+
+limma_data <- neqc(raw_limma)
+limma_data$other$Detection %>% colnames()
+
+limma_order <- limma_data$other$Detection %>% colnames() %>% factor(levels = unique(.)) 
+mice_code %>% arrange(match(mice_code$Mice, limma_order)) -> mice_code_arrange
+##
+
+f <- factor(mice_code_arrange$Classification)
+design <- model.matrix(~0+f)
+colnames(design) <- c("Lymph", "NonResponder", "Responder", "Untreated")
+fit <- lmFit(limma_data, design = design)
+
+contrast.matrix <- makeContrasts(NonResponder-Untreated, 
+                                 Responder-Untreated, 
+                                 NonResponder-Responder, levels = design)
+fit2 <- contrasts.fit(fit, contrasts=contrast.matrix)
+fit2 <- eBayes(fit2)
+
+o <- order(fit2$Amean, decreasing=TRUE)
+dup <- duplicated(fit2$genes$SYMBOL[o])
+fit.unique <- fit2[o,][!dup, ]
+
+## Done
+# remove mice_code and raw_data
+remove(mice_code)
+remove(raw_data)
+
+# Now we have run limma to get fit.unique first, can use this to isolate only the probe id's of highets base mean.
+# read in raw data again and 
+raw_data <- read_xlsx("../input/microarray_data_median_norm.xlsx") %>% 
+  filter(`Probe ID`%in%(fit.unique$genes %>% rownames()))
+
+mice_code <- tibble("Mice"=colnames(raw_data[2:17]),
+                    "Classification"= c("Lymph_Node", 
+                                        rep("Responder",5),
+                                        rep("Untreated", 5), 
+                                        rep("Non-Responder",5)))
+
+# Create some names
+unite(mice_code, full_name, 1:2) -> full_names
+
+targets <- tibble("SampleID"=full_names$full_name, 
+                  "group"=(
+                    sub("^.{4}_", "", full_names$full_name)%>%{
+                      sub("^.{3}_", "", (.))}%>%{
+                        sub("^.{5}_", "", (.))}%>%{
+                          sub("LN_Lymph_Node", "Lymph Node", (.))}
+                  ))
+
+# Show the targets file
+targets
+
+# How many are duplicated?
+raw_data$ILMN_GENE %>% duplicated() %>% table()
+raw_data$ILMN_GENE %>% unique() %>% length()
+reformat <- raw_data[ , 1:17] %>% as_tibble() %>% `colnames<-`(c("Probe ID", full_names$full_name))
+
+reformat <- left_join(reformat, mouseref_8v2[ , c("Probe_Id", "Entrez_Gene_ID", "Symbol", "Source")],
+                      by = c("Probe ID"="Probe_Id")) %>% 
+  dplyr::select(-c("Probe ID", Entrez_Gene_ID, Source) )
+
+reformat[1:16] %>% colSums()
+reformat[1:16] %>% as.matrix() %>% `rownames<-`(reformat$Symbol) -> mat_hp
+
+```
+
+
+
+```{r FIGURE 1 Limma analysis of DEGs, echo=T, fig.height=6, fig.width=14, message=FALSE, warning=FALSE, include=T}
+
+# Now run the normal limma analysis on the original median normalised data (historic).
+# This data was first used in other Gallimore papers and by the first author.
+# Hence that was what was used for all later analyses.
+# Could just use the analysis done on ILMN, but this will not match the previous figures and data.
+# Also having done it results are very similar.
+limma_data <- reformat[,-c(1, 17)] %>% `row.names<-`(reformat$Symbol )
+
+f <- factor(targets[-1,]$group)
+design <- model.matrix(~0+f)
+colnames(design) <- c("NonResponder", "Responder", "Untreated")
+fit <- lmFit(limma_data, design = design)
+contrast.matrix <- makeContrasts(NonResponder-Untreated, Responder-Untreated, NonResponder-Responder, levels = design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+results <- decideTests(fit2)
+
+# SAVE TWO SPREADSHEETS FOR ANA
+# The Venn diagram shows the number of significant genes across the comparisons.
+png(filename = "../output/vennDiagram.png", width = 24, height = 14, units = "cm", res = 300, pointsize = 8)
+vennDiagram(results, mar = c(0,0,0,0), cex = c(2,2,2))
+dev.off()
+
+#Get the sig different genes and put them onto heatmaps
+resp_untreat <- topTable(fit2, coef=2, adjust="BH", number = Inf) %>% 
+  tibble::as_tibble(rownames="gene") %>% 
+  dplyr::filter(adj.P.Val<0.05)
+vect_resp_untreat <- c(2:11)
+
+write.table(resp_untreat, file = "../output/resp_vs_untreat.txt", 
+            col.names = T, row.names = F, quote = F, sep = "\t")
+
+resp_nonresp <- topTable(fit2, coef=3, adjust="BH", number = Inf) %>% 
+  tibble::as_tibble(rownames="gene") %>% 
+  dplyr::filter(adj.P.Val<0.05)
+vect_resp_nonresp <- c(2:6, 12:16)
+
+write.table(resp_nonresp, file = "../output/resp_vs_nonresp.txt", 
+            col.names = T, row.names = F, quote = F, sep = "\t")
+
+plot_hp <- function(genes, vector, nom){ mat_hp[rownames(mat_hp)%in%genes, vector] %>%  {
+  pheatmap((.), scale = "none", 
+           cutree_cols = 1,
+           cluster_cols = F,
+           cluster_rows = T,
+           treeheight_col = 20,
+           gaps_col = 5,
+           silent = F, 
+           show_colnames = F,
+           show_rownames = T, 
+           clustering_method = "ward.D2", 
+           clustering_distance_rows = "manhattan",
+           clustering_distance_cols = "manhattan",
+           color = colorRampPalette(
+             c("navy","white", "firebrick3"))((50)),
+           main = nom,
+           fontsize = 14)}
+}
+
+pathway_fxn <- function(gene){
+  mouseref_8v2[ (mouseref_8v2$Symbol %in% gene), "Entrez_Gene_ID"] %>% 
+    base::unique() %>% {
+      enrichPathway((.), organism = "mouse",
+                    pvalueCutoff = 0.05, 
+                    pAdjustMethod = "BH", # Benjamini Hochberg
+                    qvalueCutoff = 1,
+                    #universe = universeEntrez,
+                    minGSSize = 4, 
+                    maxGSSize = Inf, readable = T) } -> overall
+  barplot(overall, showCategory=12, 
+          cex.axis = 2, cex.names = 2, 
+          xlab = "Number of genes belonging to pathway", axes = T,
+          axisnames = T)
+}
+
+# Non-Responders High
+graphics.off()
+png(filename = "../output/nonresp_high_hp.png", height = 50*0.2, width = 15, units = "cm", res = 300, pointsize = 1)
+plot_hp(resp_nonresp %>% dplyr::filter(logFC>0) %>% pull(gene) %>% 
+          as.character(), vect_resp_nonresp, "")
+dev.off()
+
+# What pathways are higher in the non responders?
+#pathway_fxn(resp_nonresp %>% dplyr::filter(logFC>0) %>% pull(gene) %>% as.character())
+
+# Responders High
+graphics.off()
+png(filename = "../output/resp_high_hp.png", height = 50*0.74, width = 15, units = "cm", res = 300, pointsize = 1)
+plot_hp(resp_nonresp %>% dplyr::filter(logFC<0) %>% pull(gene) %>% 
+          as.character(), vect_resp_nonresp, " ")
+dev.off()
+
+# SUPP FIGURE
+graphics.off()
+png(filename = "../output/resp_high_pathways.png", width = 30, height = 10, units = "cm", res = 300, pointsize = 12)
+pathway_fxn(resp_nonresp %>% dplyr::filter(logFC<0) %>% pull(gene) %>% as.character())
+dev.off()
+
+# Expand non responders to p < 0.10 - SUPP FIG
+resp_nonresp_relax <- topTable(fit2, coef=3, adjust="BH", number = Inf) %>% 
+  tibble::as_tibble(rownames="gene") %>% 
+  dplyr::filter(adj.P.Val<0.10)
+
+graphics.off()
+png(filename = "../output/nonresp_high_p010_hp.png", width = 10, height = 46, units = "cm", res = 300, pointsize = 1)
+plot_hp(resp_nonresp_relax %>% dplyr::filter(logFC>0) %>% pull(gene) %>% as.character(), vect_resp_nonresp, "")
+dev.off()
+
+graphics.off()
+png(filename = "../output/nonresp_high_p010_pathways.png", width = 30, height = 5, units = "cm", res = 300, pointsize = 12)
+pathway_fxn(resp_nonresp_relax %>% dplyr::filter(logFC>0) %>% pull(gene) %>% as.character())
+dev.off()
+
+```
+
+
+
+```{r FIGURE 1 C New heatmap, echo=T, fig.height=6, fig.width=14, message=FALSE, warning=FALSE, include=T}
+
+annot <- data.frame(#"LogFoldChange"=resp_nonresp$logFC, "Padj"=resp_nonresp$adj.P.Val, 
+  row.names = resp_nonresp$gene,
+  "Expression"= factor(resp_nonresp$logFC<0) %>% recode_factor(`FALSE` = "Non Responder High",
+                                                               `TRUE` = "Responder High"))
+
+plot_hp <- function(genes, vector, nom){ mat_hp[rownames(mat_hp)%in%genes, vector] %>% 
+    t %>%  { 
+      # not sure about the reason for the rownames of rownames inclusion
+      pheatmap((.), scale = "none", 
+               cutree_cols = 2,
+               cluster_cols = T,
+               treeheight_col = 20,
+               
+               annotation_col = annot,
+               annotation_names_col = F,
+               annotation_names_row = F,
+               annotation_legend = F,
+               
+               gaps_row = 5,
+               cutree_rows = 1,
+               cluster_rows = F,
+               silent = F, 
+               show_colnames = T,
+               show_rownames = F, 
+               clustering_method = "ward.D2", 
+               clustering_distance_rows = "manhattan",
+               clustering_distance_cols = "manhattan",
+               color = colorRampPalette(
+                 c("navy","white", "firebrick3"))((50)),
+               main = nom,
+               fontsize = 16)}
+}
+
+#New Fig. 1C - This made it to the paper
+graphics.off()
+png(filename = "../output/new_hp_format.png", height = 12.5, width = 50, units = "cm", res = 300, pointsize = 1)
+plot_hp(resp_nonresp %>%  pull(gene) %>% 
+          as.character(), vect_resp_nonresp, "")
+dev.off()
+
+
+```
+
+
+```{r Manhattan Distances, include=T, echo=T, message=FALSE, warning=FALSE, fig.height=6, fig.width=14}
+
+run_hp <- function(Genes, Name) {
+  go <- mat_hp[(rownames(mat_hp)) %in% (Genes), vect_resp_nonresp] %>% t
+  
+  go  %>%  {
+    pheatmap((.), scale = "none",
+             cluster_cols = T,
+             cluster_rows = F,
+             gaps_row = c(5),
+             cutree_cols = 4,
+             treeheight_col = 20,
+             treeheight_row = 20,
+             silent = F,
+             show_colnames = T,
+             show_rownames = T,
+             clustering_method = "ward.D2",
+             clustering_distance_rows = "manhattan",
+             clustering_distance_cols = "manhattan",
+             color = colorRampPalette(c("navy", "white", "firebrick3"))((50)),
+             main = Name,
+             fontsize = 8)}
+}
+
+# We need to find what Tnc is clustering with.
+library(parallel)
+library(parallelDist)
+library(reshape2)
+library(magrittr)
+options(digits=4)
+
+# Work out manhattan distance of tnc with all other genes. Use responders and non responders only.
+
+dist4 <- parDist(mat_hp[ , vect_resp_nonresp], method = 'manhattan', threads = 8)
+
+#dist4 <- parDist((mat_hp[, -1 ]), method = 'manhattan', threads = 6)
+
+# turn into a matrix, reorganise into var1, var2 and then dist value
+# subset out Tnc, sort the distance values of Tnc from everything and draw heatmap of top 100 Tnc associated genes
+
+m1 <- as.matrix(dist4)
+m1[upper.tri(m1)] <- 999
+#m2 <- m1
+m2 <- subset(melt(m1), value!=999)
+
+# this is a function that outputs the desired heatmaps and csv files from a distance analysis
+manhattan <- function(gene){
+  goi <- deparse(substitute(gene))
+  
+  m2 <- m2[ m2$Var2==goi, ]
+  m2 <- m2[order(m2$value), 3:1]
+  write.table(m2, file = paste0("../output/", goi, "dist_col.txt"), row.names=F, sep="\t", quote=F)
+  
+  dist_ls <- m2 %>% arrange(desc(value))
+  
+  closest <- as.character( dist_ls[(nrow(dist_ls)-29):nrow(dist_ls), 3])
+  furthest <- as.character( dist_ls[1:30, 3])
+  
+  x <- dist_ls[(nrow(dist_ls)-29):nrow(dist_ls), c(1, 3) ] %>% set_colnames(c("Manhattan Distance", "Gene")) %>% 
+    arrange(`Manhattan Distance`) %>% mutate(`Manhattan Distance`=round(`Manhattan Distance`, digits = 2))
+  
+  write.table(x, file = paste0("../output/", goi, "closest30.csv"), 
+              row.names = F, col.names = T, sep = ",", quote = F)
+  
+  graphics.off()
+  png(filename = paste0("../output/", goi, "closest30.png"), 
+      width = 18, height = 8, units = "cm", res = 300, pointsize = 1)
+  run_hp(c(closest, goi), 
+         paste0("Bottom 30 Genes with Expression Patterns that Match ", goi))
+  dev.off()
+  
+  
+  x <- dist_ls[1:30, c(1, 3)]  %>% set_colnames(c("Manhattan Distance", "Gene")) %>% 
+    arrange( desc(`Manhattan Distance`)) %>% mutate(`Manhattan Distance`=round(`Manhattan Distance`, digits = 2)) 
+  
+  write.table(x, file = paste0("../output/", goi, "furthest30.csv"), 
+              row.names = F, col.names = T, sep = ",", quote = F)
+  
+  graphics.off()
+  png(filename = paste0("../output/", goi, "furthest30.png"), 
+      width = 18, height = 8, units = "cm", res = 300, pointsize = 1)
+  run_hp(c(furthest, goi), 
+         paste0("Top 30 Genes with Expression Patterns Opposite to ", goi))
+  dev.off()
+}
+
+manhattan(Tnc)
+
+# could have tried a spearman or pearson correlation instead.
+
+```
+
+\newline
+This section was to run lots of PCAs and look at pathways which give a high standard deviation and separate out the groups well. Didn't make it into the final publication. Also here we had to make sure the genes corresponded correctly between mouse and humans, hence the use of biomart. so the relevant code has been left in.
+\newline
+
+```{r Pathway Setup, message=FALSE, warning=FALSE, echo=TRUE, include=TRUE, results="hide"}
+
+# Reactome Pathway PCA Analysis
+all_paths_gmt <- read.gmt("../resources/ReactomePathways.gmt") %>% map(function(x){ x[-1]} ) # Remove the "Reactome pathways"
+gmt_df <- tibble("Pathway"=map(all_paths_gmt, unlist)%>%names(), "Genes"=map(all_paths_gmt, unlist) )
+
+# read in all reactome paths
+all_paths <- read.table("../resources/ReactomePathways.txt", sep = "\t", header = F) %>% 
+  as_tibble() %>%
+  filter({grepl("MMU", (.)$V1)}) %>% 
+  filter({grepl("Mus musculus", (.)$V3)}) %>% 
+  set_colnames(c("Code", "Pathway", "Species") ) %>%
+  left_join(gmt_df, by="Pathway") %>%
+  # Use dplyr here!!!
+  add_column("Number"=map_dbl((.)$Genes, length)) %>% 
+  dplyr::arrange(desc(Number)) #%>%
+#filter(Number>5) #%>%
+#filter(Number<1000) # Get rid of large pathways with over 1000 genes
+
+genes <-  all_paths$Genes %>% unlist() %>% unique()
+
+# Basic function to convert human to mouse gene names
+human <- useEnsembl("ensembl", dataset = "hsapiens_gene_ensembl")
+mouse <- useEnsembl("ensembl", dataset = "mmusculus_gene_ensembl")
+# genesV2 <- getLDS(attributes = c("hgnc_symbol"), # Attributes you want to retrieve of primary dataset. 
+#                   # A possible list of attributes can be retrieved using the function listAttributes.
+#                   filters = "hgnc_symbol", # Filters that should be used in the query. 
+#                   values = genes, 
+#                   mart = human, 
+#                   attributesL = c("mgi_symbol"), # Attributes of linked dataset that needs to be retrieved
+#                   martL = mouse, # Mart object representing linked dataset
+#                   uniqueRows=T)
+
+# Here is one I made earlier
+#saveRDS(genesV2, file = "../output/genesV2.Rdata", compress = F)
+genesV2 <- readRDS(file = "../output/genesV2.Rdata")
+
+# name the character vector correctly
+genes_recode <- as.character(genesV2$MGI.symbol) %>% `names<-`(genesV2$HGNC.symbol)
+
+# library(future)
+# library(furrr)
+# # What I am doing below is so hard that you need a big PC and then use parallel mapping
+# plan(multiprocess)
+
+# What this is doing below, is going through the all_paths$Genes area...
+# And if it finds a human gene name (which will be in capitals) in the genes_recode named character vector above...
+# Then it renames (recodes) it as the mouse equivalent...
+# It is not as simple as just changing to small letters...
+
+# These ways may interact with the bioMart server, but that can sometimes fail...
+# THAT is why I am doing it this way.
+
+# get_res <- furrr::future_map(.x=all_paths$Genes, 
+#                              .f = possibly(function(x) {
+#                                recode(.x=x, !!!genes_recode,
+#                                       # above you use a named character vector and
+#                                       # to unquote it with !!! (splicing)
+#                                       # this whole area of quos and non standard evaluation...
+#                                       # Tough
+#                                       default="no_match", .missing="missing")}, 
+#                                otherwise = "error") )
+
+# Here is one I made earlier
+# saveRDS(get_res, file = "../output/get_res.Rdata", compress = F)
+get_res <- readRDS("../output/get_res.Rdata")
+
+# Now this taking the gene names in all_paths and converting them to mouse...
+# Again, you can specify to look at mouse genes in the reactome code...
+
+#       enrichPathway((.), organism = "mouse",
+
+# However, what i did here was to put all the genes from pathways onto a PCA..
+# And this had to be done myself, hence the gene name change...
+all_paths_convert <- all_paths %>% 
+  mutate("Genes"=get_res) %>% mutate("Genes"=map((.)$Genes, unique)) %>% 
+  mutate("Number"=map_dbl((.)$Genes, length))
+
+```
+
+\newline
+Create heartbeat plots of gene expression associated with ECM and adaptive immune pathways.
+\newline
+
+```{r Heartbeat Plots adaptive Imm and ECM organisation, include=T, echo=T, message=FALSE, warning=FALSE, results='asis', fig.height=8, fig.width=24}
+
+library(ggplot2)
+
+vect_resp_nonresp <- c(2:6, 12:16)
+
+genes1 <- "Adaptive Immune System"
+genes2 <- "Extracellular matrix organization"
+
+library(forcats) # for working with factors
+
+out_genes <- tibble( "Genes"= all_paths_convert[grepl(genes1, all_paths_convert$Pathway), ] %>% 
+                       pull( "Genes") %>% unlist(), "Category"=genes1 )
+out_genes_2 <- tibble( "Genes"=all_paths_convert[grepl(genes2, all_paths_convert$Pathway), ] %>% 
+                         pull( "Genes") %>% unlist(), "Category"=genes2 )
+out_genes_df <- bind_rows(out_genes, out_genes_2)
+
+dup_ids <- out_genes_df %>% filter(duplicated(Genes))
+
+# so wierd the way this is the way to remove genes
+out_genes_df[ out_genes_df$Genes %in% dup_ids$Genes, "Category"] <- "Both Pathways"
+
+remove(out_genes, out_genes_2)
+
+out_genes_df <- out_genes_df %>% filter(Genes %>% duplicated() %>% !.)
+
+# FIND THE GENES WITH HIGHEST DIFFERENCE BETWEEN MEANS
+# This is for the plots - so there are only a sElection of genes labelled
+# Work out the mean difference between genes in responders and non-responders
+
+mean_diff <- mat_hp[rownames(mat_hp) %in% (out_genes_df%>%pull(Genes)), vect_resp_nonresp] %>% 
+  as_tibble(rownames="Genes") %>% 
+  left_join(out_genes_df, by="Genes") %>%
+  # mutate(Genes=(Genes)) %>% # what was this done for?
+  arrange(Category) %>% mutate(Genes=factor(Genes, levels = .$Genes) ) %>%
+  add_column(R_mean={rowMeans(.[, c(2:6)])}) %>% add_column(NR_mean={rowMeans(.[, c(7:11)])}) %>%
+  add_column(Abs_Mean_Diff=abs(.$R_mean - .$NR_mean)) %>% filter(Abs_Mean_Diff>1.00) 
+
+###
+# it gets used later
+
+library(ggpubr)
+
+mat_hp[rownames(mat_hp) %in% (out_genes_df%>%filter(Category=="Adaptive Immune System")%>%pull(Genes)), 
+       vect_resp_nonresp] %>% 
+  as_tibble(rownames="Genes") %>% 
+  left_join(out_genes_df%>%filter(Category=="Adaptive Immune System"), by="Genes") %>%
+  #mutate(Genes=(Genes)) %>% # Why did you do this?
+  arrange(Category) %>% mutate(Genes=factor(Genes, levels = .$Genes) ) %>%
+  gather(2:11, key = Dataset, value = Expression) %>%
+  add_column("Response"=sub(.$Dataset, pattern = "^(.*?)_", replacement = "")) %>%
+  #filter(Category=="Adaptive Immune System") %>%
+  {ggplot((.), aes(x=Genes, y=Expression, fill=Response, color=Response) ) + 
+      geom_point(position = position_dodge(width = 1), alpha=0.8, size=1.5) +
+      #facet_wrap(~Category, ncol = 1, scales = "free") + 
+      theme_pubr() + 
+      theme(legend.position = "bottom") +
+      theme(axis.text.x = element_text(angle = -90, vjust = 0.5, hjust = 0, size = 18),
+            panel.grid.major.x = element_line(color = "black"),
+            text = element_text(size=18) ) +
+      stat_summary(fun.y=mean, geom="line", aes(group=Response), size=2, alpha=0.99) +
+      ylab("Normalised Gene Expression") + xlab(element_blank()) +
+      scale_x_discrete(breaks = (.)$Genes[(.)$Genes %in% mean_diff$Genes]) # then use mean diff here
+    #ggtitle("Adaptive Immune System Genes")
+  }
+
+ggsave(filename = "../output/AIS_heartbeat.png", plot = last_plot(), device = "png", dpi = 300, width = 18, height =6)
+
+mat_hp[rownames(mat_hp) %in% (out_genes_df%>%filter(Category=="Extracellular matrix organization")%>%pull(Genes)), 
+       vect_resp_nonresp] %>% 
+  as_tibble(rownames="Genes") %>% 
+  left_join(out_genes_df%>%filter(Category=="Extracellular matrix organization"), by="Genes") %>%
+  #mutate(Genes=(Genes)) %>% 
+  arrange(Category) %>% mutate(Genes=factor(Genes, levels = .$Genes) ) %>%
+  gather(2:11, key = Dataset, value = Expression) %>%
+  add_column("Response"=sub(.$Dataset, pattern = "^(.*?)_", replacement = "")) %>%
+  #  filter(Category=="Extracellular matrix organization") %>%
+  {ggplot((.), aes(x=Genes, y=Expression, fill=Response, color=Response) ) + 
+      geom_point(position = position_dodge(width = 1), alpha=0.8, size=1.5) +
+      #facet_wrap(~Category, ncol = 1, scales = "free") + 
+      theme_pubr() + 
+      theme(legend.position = "bottom") +
+      theme(axis.text.x = element_text(angle = -90, vjust = 0.5, hjust = 0, size = 18),
+            panel.grid.major.x = element_line(color = "black"),
+            text = element_text(size=18) ) +
+      stat_summary(fun.y=mean, geom="line", aes(group=Response), size=2, alpha=0.99) +
+      ylab("Normalised Gene Expression") + xlab(element_blank()) +
+      scale_x_discrete(breaks = (.)$Genes[(.)$Genes %in% mean_diff$Genes])
+    #ggtitle("Extracellular Matrix Organisation Genes")
+  }
+
+ggsave(filename = "../output/ECM_heartbeat.png", plot = last_plot(), device = "png", dpi = 300, width = 18, height =6)
+
+```
+
+
+```{r Heartbeat Plots Mean Difference, include=T, echo=T, message=FALSE, warning=FALSE, results='asis', fig.height=6, fig.width=24}
+
+mean_diff <- mat_hp[rownames(mat_hp) %in% (out_genes_df%>%pull(Genes)), vect_resp_nonresp] %>% 
+  as_tibble(rownames="Genes") %>% 
+  left_join(out_genes_df, by="Genes") %>%
+  # mutate(Genes=(Genes)) %>% # what was this done for?
+  arrange(Category) %>% mutate(Genes=factor(Genes, levels = .$Genes) ) %>%
+  add_column(R_mean={rowMeans(.[, c(2:6)])}) %>% add_column(NR_mean={rowMeans(.[, c(7:11)])}) %>%
+  add_column(Abs_Mean_Diff=abs(.$R_mean - .$NR_mean)) %>% filter(Abs_Mean_Diff>0.50) 
+
+annot <- mean_diff[, "Category"] %>%  set_rownames(mean_diff$Genes) %>% 
+  as.data.frame(stringsAsFactors=T)
+
+run_hp <- function(Genes, Name) {
+  
+  go <- mat_hp[(rownames(mat_hp)) %in% (Genes), c(2:6, 12:16)] %>% t
+  
+  go  %>%  {
+    pheatmap((.), scale = "none",
+             cluster_cols = T,
+             cluster_rows = F,
+             annotation_col = annot,
+             annotation_colors = list(`Category`=c(`Adaptive Immune System`="dodgerblue1",
+                                                   `Both Pathways`="dimgray",
+                                                   `Extracellular matrix organization`="gold1")),
+             annotation_names_col = T,
+             annotation_names_row = F,
+             annotation_legend = T,
+             treeheight_col = 20,
+             cutree_cols = 2,
+             treeheight_row = 20,
+             silent = F,
+             gaps_row = 5,
+             show_colnames = F,
+             show_rownames = F,
+             clustering_method = "ward.D2",
+             clustering_distance_rows = "manhattan",
+             clustering_distance_cols = "manhattan",
+             color = colorRampPalette(
+               c("navy","white", "firebrick3"))((50)),
+             #main = Name,
+             fontsize = 8)}
+}
+
+graphics.off()
+png(filename = "../output/pathway_comparison.png", width = 24, height = 8, units = "cm", res = 300, pointsize = 12)
+run_hp(Genes = mean_diff$Genes, "")
+dev.off()
+
+### ECM Heatmap
+mean_diff <- mat_hp[rownames(mat_hp) %in% (out_genes_df%>%pull(Genes)), vect_resp_nonresp] %>% 
+  as_tibble(rownames="Genes") %>% 
+  left_join(out_genes_df, by="Genes") %>%
+  # mutate(Genes=(Genes)) %>% # what was this done for?
+  arrange(Category) %>% mutate(Genes=factor(Genes, levels = .$Genes) ) %>%
+  add_column(R_mean={rowMeans(.[, c(2:6)])}) %>% add_column(NR_mean={rowMeans(.[, c(7:11)])}) %>%
+  add_column(Abs_Mean_Diff=abs(.$R_mean - .$NR_mean)) %>% filter(Abs_Mean_Diff>0.50) %>%
+  filter(Category=="Extracellular matrix organization")
+
+annot <- mean_diff[, "Category"] %>%  set_rownames(mean_diff$Genes) %>% 
+  as.data.frame(stringsAsFactors=T)
+
+run_hp <- function(Genes, Name) {
+  
+  go <- mat_hp[(rownames(mat_hp)) %in% (Genes), c(2:6, 12:16)] %>% t
+  
+  go  %>%  {
+    pheatmap((.), scale = "none",
+             cluster_cols = T,
+             cluster_rows = F,
+             annotation_col = annot,
+             annotation_colors = list(`Category`=c(#`Adaptive Immune System`="dodgerblue1",
+               #`Both Pathways`="dimgray",
+               `Extracellular matrix organization`="gold1")),
+             annotation_legend = F,
+             annotation_names_row = F,
+             annotation_names_col = F,
+             treeheight_col = 20,
+             cutree_cols = 2,
+             treeheight_row = 20,
+             silent = F,
+             gaps_row = 5,
+             show_colnames = T,
+             show_rownames = F,
+             clustering_method = "ward.D2",
+             clustering_distance_rows = "manhattan",
+             clustering_distance_cols = "manhattan",
+             color = colorRampPalette(
+               c("navy","white", "firebrick3"))((50)),
+             #main = Name,
+             fontsize = 14)} 
+}
+
+graphics.off()
+png(filename = "../output/ecm_hp.png", width = 30, height = 10, units = "cm", res = 300, pointsize = 12)
+run_hp(Genes = mean_diff$Genes, "")
+dev.off()
+
+### Adaptive Immune Heatmap
+
+mean_diff <- mat_hp[rownames(mat_hp) %in% (out_genes_df%>%pull(Genes)), vect_resp_nonresp] %>% 
+  as_tibble(rownames="Genes") %>% 
+  left_join(out_genes_df, by="Genes") %>%
+  # mutate(Genes=(Genes)) %>% # what was this done for?
+  arrange(Category) %>% mutate(Genes=factor(Genes, levels = .$Genes) ) %>%
+  add_column(R_mean={rowMeans(.[, c(2:6)])}) %>% add_column(NR_mean={rowMeans(.[, c(7:11)])}) %>%
+  add_column(Abs_Mean_Diff=abs(.$R_mean - .$NR_mean)) %>% filter(Abs_Mean_Diff>0.50) %>%
+  filter(Category=="Adaptive Immune System")
+
+annot <- mean_diff[, "Category"] %>%  set_rownames(mean_diff$Genes) %>% 
+  as.data.frame(stringsAsFactors=T)
+
+run_hp <- function(Genes, Name) {
+  
+  go <- mat_hp[(rownames(mat_hp)) %in% (Genes), c(2:6, 12:16)] %>% t
+  go  %>%  {
+    pheatmap((.), scale = "none",
+             cluster_cols = T,
+             cluster_rows = F,
+             annotation_col = annot,
+             annotation_colors = list(`Category`=c(`Adaptive Immune System`="dodgerblue1"
+                                                   #`Both Pathways`="dimgray",
+                                                   #`Extracellular matrix organization`="gold1"
+             )),
+             annotation_legend = F,
+             annotation_names_row = F,
+             annotation_names_col = F,
+             treeheight_col = 20,
+             cutree_cols = 2,
+             treeheight_row = 20,
+             silent = F,
+             gaps_row = 5,
+             show_colnames = T,
+             show_rownames = F,
+             clustering_method = "ward.D2",
+             clustering_distance_rows = "manhattan",
+             clustering_distance_cols = "manhattan",
+             color = colorRampPalette(
+               c("navy","white", "firebrick3"))((50)),
+             #main = Name,
+             fontsize = 14)}
+}
+
+graphics.off()
+png(filename = "../output/ais_hp.png", width = 40, height = 10, units = "cm", res = 300, pointsize = 12)
+run_hp(Genes = mean_diff$Genes, "")
+dev.off()
+
+```
+
+
+\newline
+Analyse cancer stem cell genes. Gene list was decided by Ana and Awen.
+\newline
+
+
+```{r CSC Genes, fig.width=8, fig.height=6, message=FALSE, warning=FALSE, echo=TRUE, include=TRUE, results="asis"}
+
+csc_genes_human <- c("Zeb1", "Zeb2", "Twist1", "Twist2", "Snai1", "CD24A", "THY1", "MCAM", "TTC3", "VLDLR") %>% toupper()
+
+# Basic function to convert human to mouse gene names
+genesCSC <- getLDS(attributes = c("hgnc_symbol"), # Attributes you want to retrieve of primary dataset. 
+                   # A possible list of attributes can be retrieved using the function listAttributes.
+                   filters = "hgnc_symbol", # Filters that should be used in the query. 
+                   values = csc_genes_human, 
+                   mart = human, 
+                   attributesL = c("mgi_symbol"), # Attributes of linked dataset that needs to be retrieved
+                   martL = mouse, # Mart object representing linked dataset
+                   uniqueRows=T)
+
+csc_genes <- genesCSC$MGI.symbol
+
+run_hp <- function(genes, nom){
+  out_genes <- genes
+  go <- mat_hp[(rownames(mat_hp)) %in% (out_genes), vect_resp_nonresp%>%rev() ] 
+  
+  go  %>% t() %>% {
+    pheatmap((.), scale = "none",
+             cluster_cols = T,
+             cluster_rows = F,
+             gaps_row = 5,
+             silent = F,
+             show_colnames = T,
+             show_rownames = F,
+             clustering_method = "ward.D2",
+             clustering_distance_rows = "manhattan",
+             clustering_distance_cols = "manhattan",
+             
+             color = colorRampPalette(
+               c("navy","white", "firebrick3"))((50)),
+             fontsize = 14)}
+}
+graphics.off()
+png(filename = "../output/csc_hp.png", width = 10, height = 10, units = "cm", res = 300, pointsize = 1)
+run_hp(csc_genes, "Cancer Stem Cell Genes")
+dev.off()
+
+# GENES
+mat_hp[rownames(mat_hp) %in% csc_genes, 
+       vect_resp_nonresp %>% rev() ] %>% 
+  as_tibble(rownames="Genes") %>%  gather(2:11, key = Dataset, value = Expression) %>%
+  add_column("Response"=sub(.$Dataset, pattern = "^(.*?)_", replacement = "")) %>%
+  #filter(Category=="Adaptive Immune System") %>%
+  {ggplot((.), aes(x=Genes, y=Expression, fill=Response, color=Response) ) + 
+      geom_point(position = position_dodge(width = 0.25), alpha=0.8, size=1.5) +
+      #facet_wrap(~Category, ncol = 1, scales = "free") + 
+      scale_color_manual(values = c("#F8766D", "#00BFC4")%>%rev() ) +
+      scale_fill_manual(values = c("#F8766D", "#00BFC4")%>%rev()) +  
+      theme_pubr() + 
+      theme(legend.position = "bottom",
+            legend.text = element_text(size = 18),
+            axis.text.x = element_text(angle = -90, vjust = 0.5, hjust = 0, size = 18),
+            panel.grid.major.x = element_line(color = "grey90"),
+            text = element_text(size=18) ) +
+      stat_summary(fun.y=mean, geom="line", aes(group=Response), size=2, alpha=0.99) +
+      ylab("Normalised Gene Expression") + xlab(element_blank())
+  }
+
+ggsave(filename = "../output/CSC_heartbeat.png", plot = last_plot(), device = "png", dpi = 300, width = 6, height =6)
+
+```

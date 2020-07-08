@@ -1,0 +1,1030 @@
+---
+title: "TNC & TCGA Analysis"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, message=FALSE, warning=FALSE, results="hide"}
+
+setwd("~//TNC/2019_TNC_Reanalysis/bin")
+
+library(survival)
+library(survminer)
+library(rjson)
+library(tidyverse)
+library(magrittr)
+library(ClusterR)
+library(data.table)
+
+```
+
+
+```{r json processing}
+
+# https://docs.gdc.cancer.gov/Encyclopedia/pages/TCGA_Barcode/
+
+clinical_json <- fromJSON(file = "../input/clinical.cart.2019-10-22.json", simplify = F)
+
+clinical <- map_chr(.x = 1:length(clinical_json), 
+                    .f= function(x){clinical_json[[x]]$case_id}) %>% 
+  tibble("case_id"=.) %>% as_tibble() %>%
+  
+  add_column("submitter_id"=  map(.x = 1:length(clinical_json), 
+                                  .f= possibly(
+                                    .f =function(x){clinical_json[[x]]$diagnoses[[1]]$submitter_id}, 
+                                    otherwise = NULL) )) %>%
+  mutate(submitter_id=sub(pattern = "_diagnosis", replacement =  "", submitter_id)) %>%
+  
+  add_column("vital_status"=map(.x = 1:length(clinical_json), 
+                                .f= possibly(
+                                  function(x){clinical_json[[x]]$demographic$vital_status}, 
+                                  otherwise = NULL))%>% as.character() ) %>%
+  
+  add_column("days_to_death"=map(.x = 1:length(clinical_json), 
+                                 .f= possibly(
+                                   function(x){clinical_json[[x]]$demographic$days_to_death}, 
+                                   otherwise = NULL)) ) %>%
+  mutate(days_to_death=as.integer(days_to_death %>% as.character())) %>%
+  
+  add_column("days_to_last_follow_up"=map(.x = 1:length(clinical_json), 
+                                          .f= possibly(
+                                            function(x){clinical_json[[x]]$diagnoses[[1]]$days_to_last_follow_up}, 
+                                            otherwise = NULL)) ) %>%
+  mutate(days_to_last_follow_up=as.integer(days_to_last_follow_up %>% as.character())) %>%
+  
+  add_column("tumor_stage"=map(.x = 1:length(clinical_json), 
+                               .f= possibly(
+                                 function(x){clinical_json[[x]]$diagnoses[[1]]$tumor_stage}, 
+                                 otherwise = NULL))%>% as.character() ) %>%
+  
+  add_column("tumor_grade"=map(.x = 1:length(clinical_json), 
+                               .f= possibly(
+                                 function(x){clinical_json[[x]]$diagnoses[[1]]$tumor_grade}, 
+                                 otherwise = NULL))%>% as.character() )
+
+```
+
+
+```{r create meta}
+
+sample_sheet <- read.table("../input/gdc_sample_sheet.2019-10-22.tsv", sep = "\t",
+                           header = T, stringsAsFactors = F ) %>% as_tibble()
+
+sample_clinical_df <- left_join(sample_sheet %>% 
+                                  mutate(File.Name=sub(pattern = ".htseq.counts.gz", 
+                                                       replacement = "",  sample_sheet$File.Name)), 
+                                clinical, by = c("Case.ID"="submitter_id"), keep=T)
+
+files <-  sub(pattern = ".gz", replacement = "",  sample_sheet$File.Name)
+
+```
+
+
+```{r read file}
+
+library(data.table)
+
+TCGA_data <- map_dfc(.x= paste0("../TCGA_3_10_2019/files/", files) , .f= fread, drop = 1, data.table = FALSE,
+                     nThread = 6,
+                     header = FALSE, colClasses = c("numeric") )
+
+# gene_check <- map_dfc(.x= paste0("../TCGA_3_10_2019/files/", files)[c(1:100, 9000:9500)] , 
+#                       .f= fread, drop = 2, data.table = FALSE,
+#                             nThread = 6,
+#                             header = FALSE, colClasses = c("character") )
+# 
+# map_chr(1:600, function(i){ identical(gene_check[[1]], gene_check[[i]])}) %>% table
+# Nice.
+
+use_4_name <- read.table("../TCGA_3_10_2019/files/0000772b-773d-4cf8-8baf-0e1e6dbf55e8.htseq.counts",
+                         header = F, col.names = c("gene", "count"))
+
+
+colnames(TCGA_data) <- basename(sub(".htseq.counts", "", files) )
+rownames(TCGA_data) <- substring(use_4_name$gene, 1, 15)
+
+complete_df <- TCGA_data %>% t() %>% as_tibble(rownames = "File.Name") %>% 
+  inner_join(sample_clinical_df, by = "File.Name")
+
+```
+\newline
+
+\newline
+```{r deseq2, message=FALSE, warning=FALSE, results="hide"}
+
+library(DESeq2)
+library(biomaRt)
+library(rtracklayer)
+library(GenomicFeatures)
+library(parallel)
+library(BiocParallel)
+
+matrix_TCGA_data <- as.matrix(TCGA_data[1:(nrow(TCGA_data)-5), ]) # Remove the last 5 rows
+
+exptDesign_TCGA <- data.frame(
+  row.names = colnames(matrix_TCGA_data),
+  condition = complete_df$Project.ID)
+# gene_check <- map_dfc(.x= paste0("../TCGA_3_10_2019/files/", files)[c(1:100, 9000:9500)] , 
+#                       .f= fread, drop = 2, data.table = FALSE,
+#                             nThread = 6,
+#                             header = FALSE, colClasses = c("character") )
+# 
+# map_chr(1:600, function(i){ identical(gene_check[[1]], gene_check[[i]])}) %>% table
+
+dds <- DESeqDataSetFromMatrix(
+  countData = matrix_TCGA_data,
+  colData = exptDesign_TCGA,
+  design = ~ 1) 
+
+dds <- DESeq2::estimateSizeFactors(dds)
+
+norm_counts <- DESeq2::counts(dds, normalized=TRUE)
+
+norm_clinical_df <- norm_counts %>% t() %>% as_tibble(rownames = "File.Name") %>% 
+  inner_join(sample_clinical_df, by = "File.Name")
+
+```
+
+```{r TPM}
+# This was not used here - the TPM counts were used for Immune deconvolution that did not make the final manuscript.
+
+# Make TPM counts
+# https://support.bioconductor.org/p/91218/
+
+# https://gdc.cancer.gov/about-data/data-harmonization-and-generation/gdc-reference-files
+# https://docs.gdc.cancer.gov/Data/Bioinformatics_Pipelines/Expression_mRNA_Pipeline/
+
+# get gene lengths there
+# look @ Rob's code
+# txdb <- makeTxDbFromGRanges(import("../resources/gencode.v22.annotation.gtf"))
+# allTranscripts <- transcriptLengths(txdb)
+# allGeneIDs <- unique(allTranscripts$gene_id)
+# gene_len_df <- allTranscripts %>% 
+#   group_by(gene_id) %>% summarize(max.tx_len = max(tx_len)) %>%
+#   as_tibble %>% mutate(gene_id=map_chr(gene_id, substring, 1, 15))
+
+# Is this the same as the raw data?
+# counts.mat <- counts(dds, normalized=FALSE)
+# Yes - other than one is integer and one numeric
+# identical(counts.mat%>%as.numeric, 
+#           matrix_TCGA_data%>%as.numeric)
+
+# Are the genes the same?
+# identical(counts.mat%>%rownames, 
+#           gene_len_df$gene_id)
+# Yeah
+
+# gene.length <- gene_len_df$max.tx_len
+# x <- counts.mat / gene.length
+# tpm.mat <- t( t(x) * 1e6 / colSums(x) )
+# 
+# tpm_clinical_df <- tpm.mat %>% t() %>% as_tibble(rownames = "File.Name") %>% 
+#   inner_join(sample_clinical_df, by = "File.Name")
+
+# check TPM clinical
+
+```
+\newline
+
+\newline
+```{r gene signatures}
+
+TNC_signature <- c('TNC')
+TNC_genes <- c('ENSG00000041982')
+
+CTL_signature <- c('CD3D',	'CD3E',	'CD3G',	'CD8A',	'PTPRC')
+CTL_genes <- c('ENSG00000167286',	'ENSG00000198851',	'ENSG00000160654',	
+               'ENSG00000153563',	'ENSG00000081237')
+
+CytoTox_signature <- c('GNLY',	'GZMA',	'GZMB',
+                       'GZMH',	'GZMK',	'PRF1')
+CytoTox_genes <- c('ENSG00000115523',	'ENSG00000145649',	'ENSG00000100453',
+                   'ENSG00000100450',	'ENSG00000113088',	
+                   'ENSG00000180644')
+
+CSC_signature <- c('VLDLR', 'TTC3', 'MCAM', 'TWIST1', 'ZEB1', 
+                   'SNAI1', 'TWIST2', 'SNAI3', 'THY1', 'ZEB2', 
+                   'CD24A', 'PROM1')
+
+CSC_genes <- c('ENSG00000147852', 'ENSG00000182670', 'ENSG00000076706', 'ENSG00000122691', 'ENSG00000148516',
+               'ENSG00000124216', 'ENSG00000233608', 'ENSG00000185669', 'ENSG00000154096', 'ENSG00000169554',
+               'ENSG00000272398', 'ENSG00000007062')
+
+signature <- c(TNC_signature,
+               CTL_signature, 
+               CytoTox_signature,
+               CSC_signature)
+
+genes <- c(TNC_genes, 
+           CTL_genes, 
+           CytoTox_genes,
+           CSC_genes)
+
+# check this with biomart
+mart <- useMart(biomart = "ensembl",dataset="hsapiens_gene_ensembl")
+all_names <- getBM(filters= "ensembl_gene_id",
+                   attributes= c("external_gene_name"),
+                   values= genes,
+                   mart= mart)
+
+df <- norm_clinical_df %>% dplyr::select( c("Project.ID",  "Case.ID", "Sample.ID",  
+                                            "Sample.Type", "File.Name",
+                                            "vital_status", 
+                                            "days_to_death",  "days_to_last_follow_up",
+                                            #"tumor_stage", # you aren't using tumor stage here
+                                            all_of(genes)) ) %>% # why use all_of?
+  dplyr::filter(Sample.Type=="Primary Tumor") %>% as_tibble()
+
+colnames(df)[9:(8+length(genes))] <- signature
+
+# Are there multipe samples for the same biopsy 
+# df$Sample.ID %>% duplicated %>% table
+# df$Case.ID %>% duplicated %>% table
+
+# df %>% filter( duplicated(Case.ID)|duplicated(Sample.ID) ) %>% 
+#   pull(Case.ID) %>% {filter(.data = df, Case.ID %in% (.))} %>% 
+#   filter(!duplicated(Case.ID)) %>%
+#   filter(!duplicated(Sample.ID)) %>%
+#   arrange(Sample.ID) %>%
+#   arrange(Case.ID)
+# Yes
+# https://www.biostars.org/p/311017/
+# https://www.biostars.org/p/310587/
+# https://www.biostars.org/p/308192/
+
+# These duplicates must be removed
+# nrow(df)
+
+df <- df %>%  filter(!duplicated(Case.ID)) %>%
+  filter(!duplicated(Sample.ID))
+
+nrow(norm_clinical_df %>% dplyr::select( c("Project.ID",  "Case.ID", "Sample.ID",  
+                                           "Sample.Type", "File.Name") ) %>% 
+       dplyr::filter(Sample.Type=="Primary Tumor"))
+
+# nrow(df)
+
+```
+\newline
+
+Look at the expression of CTL and TNC - this is why we keep the different cancers separate.\newline
+
+\newline
+```{r Gene Expression Plots, fig.height=6, fig.width=12}
+
+df %>% gather(key = "Gene", value = "Counts", all_of( c(CTL_signature, CytoTox_signature))) %>% 
+  ggplot(aes(x= Project.ID, y= log(Counts), color = Project.ID)) +
+  #ggplot(aes(x= interaction(Gene, Project.ID), y= log(Counts), color = Project.ID)) +
+  geom_point(position = "jitter", size = 0.5) + theme_bw() + theme(legend.position = "none") +
+  geom_boxplot(alpha=0.4) +
+  theme(text = element_text(size = 10),
+        plot.title = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        axis.text.x = element_text(angle = 270, size = 10),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()
+  ) + ylab("Log CTL Expression") + xlab(NULL) +
+  #facet_wrap(~Gene, ncol = 4)
+  # ylim( 0, 150000) + 
+  ggsave("../output/NU_CTL_Norm_exp_cancers.png",  device = "png", units = "cm", plot = last_plot(),
+         width = 20, height = 10, dpi = 300)
+
+df %>% gather(key = "Gene", value = "Counts", TNC) %>% 
+  ggplot(aes(x= Project.ID, y= log(Counts), color = Project.ID)) +
+  geom_point(position = "jitter", size = 0.5) + theme_bw() + theme(legend.position = "none") +
+  geom_boxplot(alpha=0.4) +
+  theme(text = element_text(size = 10),
+        plot.title = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        axis.text.x = element_text(angle = 270, size = 10),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()
+  ) + ylab("Log TNC Expression") + xlab(NULL) +
+  ggsave("../output/NU_TNC_Norm_exp_cancers.png",  device = "png", units = "cm", plot = last_plot(),
+         width = 20, height = 10, dpi = 300)
+
+# based on this graph, BCRA, LUAD and SARC are the cancers where TNC expression varies most
+# maybe COAD and PAAD
+
+```
+
+```{r survival setup}
+
+df_survival <- df %>% as_tibble %>% 
+  add_column("times"=NA %>% as.integer(), .before=8)
+
+for (i in 1:length(df_survival[[1]])){
+  if (is.na( (df_survival[i , ]$days_to_death)) ){
+    df_survival[i , ]$times <- df_survival[i , ]$"days_to_last_follow_up"
+  }else
+  {
+    df_survival[i , ]$times <- df_survival[i , ]$"days_to_death"
+  }
+}
+
+df_survival$times <- as.integer(df_survival$times)
+# df_survival$vital_status %>% table
+# df_survival$vital_status %>% is.na %>% table
+# 6 are not reported.
+# 5 are NA
+df_survival$vital_status <- recode(df_survival$vital_status, 
+                                   Alive="0", Dead="1", `Not Reported` = NA_character_
+)
+# df_survival$vital_status %>% table
+# df_survival$vital_status %>% is.na %>% table
+
+# check this, where does it say 0 and 1 
+# in the survminer vignetter, not survival vignette
+# patient.vital_status = survival status. 0 = alive, 1 = dead
+df_survival$vital_status <- as.numeric(df_survival$vital_status)
+
+comp_analysis <- df_survival[ 
+  !(is.na( df_survival$times))&!(is.na( df_survival$vital_status)), 
+  ] %>%  as_tibble 
+
+# No of patients with no times or vital status
+# nrow(df_survival)-nrow(comp_analysis)
+
+```
+\newline
+2.1 Analysis in the paper CTL First, TNC after.\newline
+\newline
+```{r Standard Clustering Analysis}
+
+cancers_tb_removed <- c("TCGA-KIRC", "TCGA-KIRP", "TCGA-LGG", "TCGA-PCPG", 
+                        "TCGA-THCA", "TCGA-PRAD", "TCGA-PAAD")
+
+full_data_creation <- function(to_be_removed = "NULL"){
+  
+  data_for_cluster <- comp_analysis  %>% filter( !(Project.ID %in% to_be_removed))
+  
+  tcell <- c(CytoTox_signature, CTL_signature)
+  
+  project_ids <- data_for_cluster$Project.ID %>% table() %>% names()
+  
+  cluster_by_ctl <- map(.x= project_ids, .f= function(x){  
+    
+    go <- data_for_cluster %>% filter(Project.ID %in% x)
+    
+    medoids_tnc <- Cluster_Medoids( center_scale( as.matrix(go %>% dplyr::select(all_of(tcell))), 
+                                                  mean_center = T, sd_scale = T ),
+                                    clusters = 2, 
+                                    distance_metric = "manhattan", 
+                                    swap_phase = T, 
+                                    seed = 123)
+    
+    go <- go %>% mutate("cluster"= (medoids_tnc$clusters %>% as.character))
+    
+    clust_1 <- map(go %>% filter(cluster=="1") %>% # why not try map_dbl
+                     dplyr::select(all_of(tcell)), .f = mean) %>% # get the mean of each tcell gene
+      unlist %>% mean # get the mean of gene means
+    
+    clust_2 <- map(go %>% filter(cluster=="2") %>% 
+                     dplyr::select(all_of(tcell)), .f = mean) %>% 
+      unlist %>% mean
+    
+    go <- go %>% mutate(cluster= case_when(
+      (clust_1 > clust_2)&(.$cluster=="1")  ~ "CTL High",
+      (clust_1 > clust_2)&(.$cluster=="2")  ~ "CTL Low",
+      (clust_2 > clust_1)&(.$cluster=="2")  ~ "CTL High",
+      (clust_2 > clust_1)&(.$cluster=="1")  ~ "CTL Low")) %>%
+      as.data.frame
+    
+    return(go)
+  })
+  names(cluster_by_ctl) <- project_ids
+  
+  ## Second Level
+  cluster_ctl_by_tnc <- map(.x= cluster_by_ctl, .f= function(x){
+    
+    go <- x
+    
+    medoids_ctl_high <- Cluster_Medoids( center_scale( 
+      as.matrix(go %>% filter(cluster=="CTL High") %>% dplyr::select("TNC")), 
+      mean_center = T, sd_scale = T ),
+      clusters = 2, 
+      distance_metric = "manhattan", 
+      swap_phase = T, 
+      seed = 123)
+    
+    medoids_ctl_low <- Cluster_Medoids( center_scale( 
+      as.matrix(go %>% filter(cluster=="CTL Low") %>% dplyr::select("TNC")), 
+      mean_center = T, sd_scale = T ),
+      clusters = 2, 
+      distance_metric = "manhattan", 
+      swap_phase = T, 
+      seed = 123)
+    
+    ### CTL High
+    go[ go$cluster=="CTL High", "cluster2"] <- medoids_ctl_high$clusters %>% as.character
+    ### CTL Low
+    go[ go$cluster=="CTL Low", "cluster2"] <- medoids_ctl_low$clusters %>% as.character
+    
+    mean_fxn <- function(clus1, clus2){
+      map(go %>% filter(cluster==!!clus1) %>%
+            filter(cluster2==!!clus2) %>% 
+            dplyr::select("TNC"), .f = mean) %>%  # for each group get the column mean
+        unlist }
+    
+    clust_ctlhi_1 <- mean_fxn("CTL High", "1")
+    clust_ctlhi_2 <- mean_fxn("CTL High", "2")
+    clust_ctllo_1 <- mean_fxn("CTL Low", "1")
+    clust_ctllo_2 <- mean_fxn("CTL Low", "2")
+    
+    go <- go %>% mutate(cluster2= case_when(
+      (.$cluster=="CTL High")&(clust_ctlhi_1 > clust_ctlhi_2)&(.$cluster2=="1") ~ "TNC High",
+      (.$cluster=="CTL High")&(clust_ctlhi_1 > clust_ctlhi_2)&(.$cluster2=="2") ~ "TNC Low",
+      (.$cluster=="CTL High")&(clust_ctlhi_2 > clust_ctlhi_1)&(.$cluster2=="2") ~ "TNC High",
+      (.$cluster=="CTL High")&(clust_ctlhi_2 > clust_ctlhi_1)&(.$cluster2=="1") ~ "TNC Low",
+      (.$cluster=="CTL Low")&(clust_ctllo_1 > clust_ctllo_2)&(.$cluster2=="1")  ~ "TNC High",
+      (.$cluster=="CTL Low")&(clust_ctllo_1 > clust_ctllo_2)&(.$cluster2=="2")  ~ "TNC Low",
+      (.$cluster=="CTL Low")&(clust_ctllo_2 > clust_ctllo_1)&(.$cluster2=="2")  ~ "TNC High",
+      (.$cluster=="CTL Low")&(clust_ctllo_2 > clust_ctllo_1)&(.$cluster2=="1")  ~ "TNC Low"
+    )) %>% as.data.frame
+    
+    return(go)  
+    
+  })
+  
+  return(cluster_ctl_by_tnc)
+}
+
+all_cancer <- full_data_creation()
+ctl_corr_cancers <- full_data_creation(cancers_tb_removed)
+
+```
+
+
+
+```{r figure 2, fig.height=18, fig.width=12}
+# does TNC correlate with survival?
+go <- map_df(ctl_corr_cancers, ~as.data.frame(.))
+
+fit <- survfit(Surv( times, vital_status ) ~ cluster,
+               data = go )
+
+# FIGURE 2A
+survp <- ggsurvplot(fit, go,
+                    legend.labs = c("CTL High", "CTL Low"),
+                    palette = c("darkorange1", "seagreen4"),
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(6000, 0.9),
+                    ggtheme = theme_survminer(),
+                    #xlim=c(0,5000), 
+                    break.x.by = 2000,
+                    title = c("CTL Clustering"),
+                    xlab = c("Time (days)"),
+                    tables.y.text = F,
+                    ncol=2) %>% ggpar(font.main = c(12, "bold", "darkblue"),
+                                      font.x = c(12, "bold.italic", "darkred"),
+                                      font.y = c(12, "bold.italic", "darkred"),
+                                      font.legend = c(12, "plain", "black"))
+ggsave(filename =  paste("../output/", "Fig_2A.png", sep = ""), 
+       device = "png", units = c("cm"), dpi = 300, width = 14, height = 12, plot = print( survp))
+survp
+
+# FIGURE 2B
+fit <- survfit(Surv( times, vital_status ) ~ cluster2,
+               data = go[ go$cluster=="CTL High", ])
+survp <- ggsurvplot(fit, go[ go$cluster=="CTL High", ],
+                    legend.labs = c("TNC High", "TNC Low"),
+                    palette = c("firebrick3", "dodgerblue3"),
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(6000, 0.9),
+                    ggtheme = theme_survminer(),
+                    #xlim=c(0,5000), 
+                    break.x.by = 2000,
+                    title = c("CTL High & TNC Clustering"),
+                    font.main = c(12, "bold", "darkblue"),
+                    font.x = c(12, "bold.italic", "darkred"),
+                    font.y = c(12, "bold.italic", "darkred"),
+                    font.tickslab = c(12, "plain", "darkgreen"),
+                    xlab = c("Time (days)"),
+                    tables.y.text =F,
+                    ncol=2)  %>% ggpar(font.main = c(12, "bold", "darkblue"),
+                                       font.x = c(12, "bold.italic", "darkred"),
+                                       font.y = c(12, "bold.italic", "darkred"),
+                                       font.legend = c(12, "plain", "black"))
+ggsave(filename =  paste("../output/", "Fig_2B.png", sep = ""), 
+       device = "png", units = c("cm"), dpi = 300, width = 14, height = 12, plot = print( survp))
+survp
+
+# FIGURE 2C
+fit <- survfit(Surv( times, vital_status ) ~ cluster2,
+               data = go[ go$cluster=="CTL Low", ])
+survp <- ggsurvplot(fit, go[ go$cluster=="CTL Low", ],
+                    legend.labs = c("TNC High", "TNC Low"),
+                    palette = c("firebrick3", "dodgerblue3"),
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(6000, 0.9),
+                    ggtheme = theme_survminer(),
+                    #xlim=c(0,5000), 
+                    break.x.by = 2000,
+                    title = c("CTL Low & TNC Clustering"),
+                    font.main = c(12, "bold", "darkblue"),
+                    font.x = c(12, "bold.italic", "darkred"),
+                    font.y = c(12, "bold.italic", "darkred"),
+                    font.tickslab = c(12, "plain", "darkgreen"),
+                    xlab = c("Time (days)"),
+                    tables.y.text =F,
+                    ncol=2) %>% ggpar(font.main = c(12, "bold", "darkblue"),
+                                      font.x = c(12, "bold.italic", "darkred"),
+                                      font.y = c(12, "bold.italic", "darkred"),
+                                      font.legend = c(12, "plain", "black"))
+
+ggsave(filename =  paste("../output/", "Fig_2C.png", sep = ""), 
+       device = "png", units = c("cm"), dpi = 300, width = 14, height = 12, plot = print( survp))
+survp
+
+```
+
+```{r Supp Fig 4, fig.height=10, fig.width=12}
+
+# SUPP FIGURE 4A
+go <- map_df(all_cancer, ~as.data.frame(.))
+
+fit <- survfit(Surv( times, vital_status ) ~ Project.ID + cluster,
+               data = go )
+
+survp <- ggsurvplot(fit, go,
+                    legend.labs = c("CTL High", "CTL Low"),
+                    palette = c("darkorange1", "seagreen4"),
+                    facet.by = "Project.ID", 
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(6000, 0.9),
+                    ggtheme = theme_survminer(),
+                    #xlim=c(0,5000), 
+                    break.x.by = 2000,
+                    title = c("CTL Clustering"),
+                    font.main = c(12, "bold", "darkblue"),
+                    font.x = c(12, "bold.italic", "darkred"),
+                    font.y = c(12, "bold.italic", "darkred"),
+                    font.tickslab = c(12, "plain", "darkgreen"),
+                    xlab = c("Time (days)"),
+                    tables.y.text =F,
+                    
+                    ncol=3, scales = "fixed") %>% ggpar(font.main = c(12, "bold", "darkblue"),
+                                                        font.x = c(12, "bold.italic", "darkred"),
+                                                        font.y = c(12, "bold.italic", "darkred"),
+                                                        font.legend = c(12, "plain", "black"))
+
+ggsave(filename =  paste("../output/", "Supp_Fig3.png", sep = ""), 
+       device = "png", units = c("cm"), dpi = 300, width = 25, height = 40, plot = print( survp))
+survp
+
+# Have a look at the results of clustering here
+
+go %>% gather(all_of( c(CytoTox_signature, CTL_signature)), key = "Tcell", value = "Exp") %>%
+  ggplot(aes(x = Project.ID, y = Exp, fill = cluster)) + 
+  geom_point(position = position_dodge(width = 0.75), size = 0.75) + theme_bw() + 
+  theme(legend.position = "bottom") +
+  geom_boxplot(alpha=0.4) +
+  theme(text = element_text(size = 10),
+        plot.title = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        axis.text.x = element_text(angle = 270, size = 10),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()
+  ) + ylab("Log Gene Expression") + xlab(NULL) + 
+  #scale_y_continuous(limits = c(0, 4e+05)) +
+  facet_wrap(ncol = 2, ~Tcell, scales = "free") + 
+  ggsave("../output/NU_gene_exp_clusters_tcell.png", 
+         dpi = 300, device = "png", width = 26, height = 32)
+
+go %>% ggplot(aes(x = Project.ID, y = TNC, fill = cluster2)) + 
+  geom_point(position = position_dodge(width = 0.75), size = 0.75) + theme_bw() + 
+  theme(legend.position = "bottom") +
+  geom_boxplot(alpha=0.4) +
+  theme(text = element_text(size = 10),
+        plot.title = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        axis.text.x = element_text(angle = 270, size = 10),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()
+  ) + ylab("Log TNC Expression") + xlab(NULL) + 
+  scale_y_continuous(limits = c(0, 4e+05)) +
+  facet_wrap(ncol = 1, ~cluster, scales = "free") + 
+  ggsave("../output/NU_gene_exp_clusters_tnc.png", 
+         dpi = 300, device = "png", width = 14, height = 8)
+
+# Other way
+
+go %>% gather(all_of( c(CytoTox_signature, CTL_signature)), key = "Tcell", value = "Exp") %>%
+  ggplot(aes(x = Project.ID, y = Exp, fill = cluster2)) + 
+  geom_point(position = position_dodge(width = 0.75), size = 0.75) + theme_bw() + 
+  theme(legend.position = "bottom") +
+  geom_boxplot(alpha=0.4) +
+  theme(text = element_text(size = 10),
+        plot.title = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        axis.text.x = element_text(angle = 270, size = 10),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()
+  ) + ylab("Log Gene Expression") + xlab(NULL) + 
+  #scale_y_continuous(limits = c(0, 4e+05)) +
+  facet_wrap(ncol = 2, ~Tcell, scales = "free") + 
+  ggsave("../output/NU_gene_exp_clusters_tcell_in_tnc.png", 
+         dpi = 300, device = "png", width = 26, height = 32)
+
+go %>% ggplot(aes(x = Project.ID, y = TNC, fill = cluster)) + 
+  geom_point(position = position_dodge(width = 0.75), size = 0.75) + theme_bw() + 
+  theme(legend.position = "bottom") +
+  geom_boxplot(alpha=0.4) +
+  theme(text = element_text(size = 10),
+        plot.title = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        axis.text.x = element_text(angle = 270, size = 10),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()
+  ) + ylab("Log TNC Expression") + xlab(NULL) + 
+  scale_y_continuous(limits = c(0, 4e+05)) +
+  facet_wrap(ncol = 1, ~cluster2, scales = "free") + 
+  ggsave("../output/NU_gene_exp_clusters_tnc_in_tcell.png", 
+         dpi = 300, device = "png", width = 14, height = 8)
+
+```
+
+```{r write tpm csv}
+
+# colnames(go)
+# colnames(tpm_clinical_df[1])
+# 
+# joined <- left_join(go, tpm_clinical_df %>% dplyr::filter(Sample.Type=="Primary Tumor"), 
+#                     by = c("File.Name"))
+# 
+# fwrite(x= joined, file = "../output/denconv_clusters.csv",
+#        sep = ",", row.names = F, col.names = T)
+
+```
+
+
+```{r Supp Fig 4B, fig.height=14, fig.width=8}
+
+go <- map_df(ctl_corr_cancers, ~as.data.frame(.))
+
+#SUPP  FIGURE 4A
+fit <- survfit(Surv( times, vital_status ) ~ Project.ID + cluster2,
+               data = go[ go$cluster=="CTL High", ])
+
+survp <-  ggsurvplot(fit = fit, data = go[ go$cluster=="CTL High", ], 
+                     legend.labs = c("TNC High", "TNC Low"),
+                     palette = c("firebrick3", "dodgerblue3"),
+                     risk.table = T, 
+                     risk.table.height = 0.3,
+                     pval = TRUE, 
+                     pval.coord = c(6000, 0.9),
+                     ggtheme = theme_survminer(),
+                     #xlim=c(0,5000), #
+                     #break.x.by = 2000,
+                     title = c("CTL High & TNC Clustering"),
+                     font.main = c(12, "bold", "darkblue"),
+                     font.x = c(12, "bold.italic", "darkred"),
+                     font.y = c(12, "bold.italic", "darkred"),
+                     font.tickslab = c(12, "plain", "darkgreen"),
+                     xlab = c("Time (days)"),
+                     tables.y.text =F,
+                     
+                     facet.by = "Project.ID",
+                     ncol=2) %>% ggpar(font.main = c(12, "bold", "darkblue"),
+                                       font.x = c(12, "bold.italic", "darkred"),
+                                       font.y = c(12, "bold.italic", "darkred"),
+                                       font.legend = c(12, "plain", "black"))
+ggsave(filename =  paste("../output/", "Supp_Fig4.png", sep = ""),
+       device = "png", units = c("cm"), dpi = 300, width = 25, height = 40,
+       plot = print( survp))
+survp
+
+```
+
+```{r Supp Fig 4C, fig.height=14, fig.width=8}
+
+# SUPP FIGURE 5
+fit <- survfit(Surv( times, vital_status ) ~ Project.ID + cluster2,
+               data = go[ go$cluster=="CTL Low", ])
+survp <-  ggsurvplot(fit = fit, data = go[ go$cluster=="CTL Low", ], 
+                     risk.table = T, 
+                     risk.table.height = 0.3,
+                     legend.labs = c("TNC High", "TNC Low"),
+                     palette = c("firebrick3", "dodgerblue3"),
+                     pval = TRUE, 
+                     pval.coord = c(6000, 0.9),
+                     ggtheme = theme_survminer(),
+                     #xlim=c(0,5000), #
+                     #break.x.by = 2000,
+                     title = c("CTL Low & TNC Clustering"),
+                     font.main = c(12, "bold", "darkblue"),
+                     font.x = c(12, "bold.italic", "darkred"),
+                     font.y = c(12, "bold.italic", "darkred"),
+                     font.tickslab = c(12, "plain", "darkgreen"),
+                     xlab = c("Time (days)"),
+                     tables.y.text =F,
+                     
+                     facet.by = "Project.ID",
+                     ncol=2) %>% ggpar(font.main = c(12, "bold", "darkblue"),
+                                       font.x = c(12, "bold.italic", "darkred"),
+                                       font.y = c(12, "bold.italic", "darkred"),
+                                       font.legend = c(12, "plain", "black"))
+ggsave(filename =  paste("../output/", "Supp_Fig5.png", sep = ""),
+       device = "png", units = c("cm"), dpi = 300, width = 25, height = 40,
+       plot = print( survp))
+survp
+
+```
+\newline
+
+\newline
+```{r reverse analysis}
+
+reverse_data_creation <- function(to_be_removed = "NULL"){
+  
+  data_for_cluster <- comp_analysis  %>% filter( !(Project.ID %in% to_be_removed))
+  
+  tcell <- c(CytoTox_signature, CTL_signature)
+  
+  project_ids <- data_for_cluster$Project.ID %>% table() %>% names()
+  
+  cluster_by_tnc <- map(.x= project_ids, .f= function(x){  
+    
+    go <- data_for_cluster %>% filter(Project.ID %in% x)
+    
+    medoids_tnc <- Cluster_Medoids( center_scale( as.matrix(go %>% dplyr::select("TNC")), 
+                                                  mean_center = T, sd_scale = T ),
+                                    clusters = 2, 
+                                    distance_metric = "manhattan", 
+                                    swap_phase = T, 
+                                    seed = 123)
+    
+    go <- go %>% mutate("cluster"= (medoids_tnc$clusters %>% as.character))
+    
+    clust_1 <- map(go %>% filter(cluster=="1") %>% 
+                     dplyr::select("TNC"), .f = mean) %>% unlist
+    clust_2 <- map(go %>% filter(cluster=="2") %>% 
+                     dplyr::select("TNC"), .f = mean) %>% unlist
+    
+    go <- go %>% mutate(cluster= case_when(
+      (clust_1 > clust_2)&(.$cluster=="1")  ~ "TNC High",
+      (clust_1 > clust_2)&(.$cluster=="2")  ~ "TNC Low",
+      (clust_2 > clust_1)&(.$cluster=="2")  ~ "TNC High",
+      (clust_2 > clust_1)&(.$cluster=="1")  ~ "TNC Low")) %>%
+      as.data.frame
+    
+    return(go)
+  })
+  names(cluster_by_tnc) <- project_ids
+  
+  ## Second Level
+  cluster_tnc_by_ctl <- map(.x= cluster_by_tnc, .f= function(x){
+    
+    go <- x
+    
+    medoids_tnc_high <- Cluster_Medoids( center_scale( 
+      as.matrix(go %>% filter(cluster=="TNC High") %>% dplyr::select(all_of(tcell))), 
+      mean_center = T, sd_scale = T ),
+      clusters = 2, 
+      distance_metric = "manhattan", 
+      swap_phase = T, 
+      seed = 123)
+    
+    medoids_tnc_low <- Cluster_Medoids( center_scale( 
+      as.matrix(go %>% filter(cluster=="TNC Low") %>% dplyr::select(all_of(tcell))), 
+      mean_center = T, sd_scale = T ),
+      clusters = 2, 
+      distance_metric = "manhattan", 
+      swap_phase = T, 
+      seed = 123)
+    
+    ### TNC High
+    go[ go$cluster=="TNC High", "cluster2"] <- medoids_tnc_high$clusters %>% as.character
+    ### TNC Low
+    go[ go$cluster=="TNC Low", "cluster2"] <- medoids_tnc_low$clusters %>% as.character
+    
+    mean_fxn <- function(clus1, clus2){
+      map(go %>% filter(cluster==!!clus1) %>%
+            filter(cluster2==!!clus2) %>% 
+            dplyr::select(all_of(tcell)), .f = mean) %>% # get the mean of each column
+        unlist %>% mean} # get the mean of all the col means
+    
+    clust_hi_1 <- mean_fxn("TNC High", "1")
+    clust_hi_2 <- mean_fxn("TNC High", "2")
+    clust_lo_1 <- mean_fxn("TNC Low", "1")
+    clust_lo_2 <- mean_fxn("TNC Low", "2")
+    
+    go <- go %>% mutate(cluster2= case_when(
+      (.$cluster=="TNC High")&(clust_hi_1 > clust_hi_2)&(.$cluster2=="1") ~ "CTL High",
+      (.$cluster=="TNC High")&(clust_hi_1 > clust_hi_2)&(.$cluster2=="2") ~ "CTL Low",
+      (.$cluster=="TNC High")&(clust_hi_2 > clust_hi_1)&(.$cluster2=="2") ~ "CTL High",
+      (.$cluster=="TNC High")&(clust_hi_2 > clust_hi_1)&(.$cluster2=="1") ~ "CTL Low",
+      (.$cluster=="TNC Low")&(clust_lo_1 > clust_lo_2)&(.$cluster2=="1")  ~ "CTL High",
+      (.$cluster=="TNC Low")&(clust_lo_1 > clust_lo_2)&(.$cluster2=="2")  ~ "CTL Low",
+      (.$cluster=="TNC Low")&(clust_lo_2 > clust_lo_1)&(.$cluster2=="2")  ~ "CTL High",
+      (.$cluster=="TNC Low")&(clust_lo_2 > clust_lo_1)&(.$cluster2=="1")  ~ "CTL Low"
+    )) %>% as.data.frame
+    
+    return(go)  
+    
+  })
+  
+  return(cluster_tnc_by_ctl)
+}
+
+rev_analysis <- reverse_data_creation(cancers_tb_removed)
+
+```
+
+```{r Supp Figure 6, fig.height=4, fig.width=6}
+go_rev <- map_df(rev_analysis, ~as.data.frame(.))
+
+# SUPP FIGURE 6A
+fit <- survfit(Surv( times, vital_status ) ~ cluster,
+               data = go_rev )
+survp <- ggsurvplot(fit, go_rev,
+                    legend.labs = c("TNC High", "TNC Low"),
+                    palette = c("firebrick3", "dodgerblue3"),
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(6000, 0.9),
+                    ggtheme = theme_survminer(),
+                    #xlim=c(0,5000), 
+                    break.x.by = 2000,
+                    title = c("TNC Clustering"),
+                    font.main = c(12, "bold", "darkblue"),
+                    font.x = c(12, "bold.italic", "darkred"),
+                    font.y = c(12, "bold.italic", "darkred"),
+                    font.tickslab = c(12, "plain", "darkgreen"),
+                    xlab = c("Time (days)"),
+                    tables.y.text =F,
+                    ncol=2)  %>% ggpar(font.main = c(12, "bold", "darkblue"),
+                                       font.x = c(12, "bold.italic", "darkred"),
+                                       font.y = c(12, "bold.italic", "darkred"),
+                                       font.legend = c(12, "plain", "black"))
+ggsave(filename =  paste("../output/", "Supp_Fig6A.png", sep = ""), 
+       device = "png", units = c("cm"), dpi = 300, width = 14, height = 12, plot = print( survp))
+survp
+
+# FIGURE 6B
+fit <- survfit(Surv( times, vital_status ) ~ cluster2,
+               data = go_rev[ go_rev$cluster=="TNC High", ])
+
+survp <- ggsurvplot(fit, go_rev[ go_rev$cluster=="TNC High", ],
+                    legend.labs = c("CTL High", "CTL Low"),
+                    palette = c("darkorange1", "seagreen4"),
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(6000, 0.9),
+                    ggtheme = theme_survminer(),
+                    #xlim=c(0,5000), 
+                    break.x.by = 2000,
+                    title = c("TNC High & CTL Clustering"),
+                    font.main = c(12, "bold", "darkblue"),
+                    font.x = c(12, "bold.italic", "darkred"),
+                    font.y = c(12, "bold.italic", "darkred"),
+                    font.tickslab = c(12, "plain", "darkgreen"),
+                    xlab = c("Time (days)"),
+                    tables.y.text =F,
+                    ncol=2)  %>% ggpar(font.main = c(12, "bold", "darkblue"),
+                                       font.x = c(12, "bold.italic", "darkred"),
+                                       font.y = c(12, "bold.italic", "darkred"),
+                                       font.legend = c(12, "plain", "black"))
+ggsave(filename =  paste("../output/", "Supp_Fig6B.png", sep = ""), 
+       device = "png", units = c("cm"), dpi = 300, width = 14, height = 12, plot = print( survp))
+survp
+
+# SUPP FIGURE 6C
+fit <- survfit(Surv( times, vital_status ) ~ cluster2,
+               data = go_rev[ go_rev$cluster=="TNC Low", ])
+survp <- ggsurvplot(fit, go_rev[ go_rev$cluster=="TNC Low", ],
+                    legend.labs = c("CTL High", "CTL Low"),
+                    palette = c("darkorange1", "seagreen4"),
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(6000, 0.9),
+                    ggtheme = theme_survminer(),
+                    #xlim=c(0,5000), 
+                    break.x.by = 2000,
+                    title = c("TNC Low & CTL Clustering"),
+                    font.main = c(12, "bold", "darkblue"),
+                    font.x = c(12, "bold.italic", "darkred"),
+                    font.y = c(12, "bold.italic", "darkred"),
+                    font.tickslab = c(12, "plain", "darkgreen"),
+                    xlab = c("Time (days)"),
+                    tables.y.text =F,
+                    ncol=2)  %>% ggpar(font.main = c(12, "bold", "darkblue"),
+                                       font.x = c(12, "bold.italic", "darkred"),
+                                       font.y = c(12, "bold.italic", "darkred"),
+                                       font.legend = c(12, "plain", "black"))
+ggsave(filename =  paste("../output/", "Supp_Fig6C.png", sep = ""), 
+       device = "png", units = c("cm"), dpi = 300, width = 14, height = 12, plot = print( survp))
+survp
+
+```
+
+
+```{r Unused Reverse Facet Plots, fig.height=26.5, fig.width=12}
+
+# TNC Survival
+fit <- survfit(Surv( times, vital_status ) ~ Project.ID + cluster,
+               data = go_rev )
+survp <- ggsurvplot(fit, go_rev,
+                    legend.labs = c("TNC High", "TNC Low"),
+                    palette = c("firebrick3", "dodgerblue3"),
+                    facet.by = "Project.ID", 
+                    risk.table = T, 
+                    risk.table.height = 0.3,
+                    pval = TRUE, 
+                    pval.coord = c(6000, 0.9),
+                    ggtheme = theme_survminer(),
+                    #xlim=c(0,5000), 
+                    break.x.by = 2000,
+                    title = c("TNC Clustering"),
+                    font.main = c(12, "bold", "darkblue"),
+                    font.x = c(12, "bold.italic", "darkred"),
+                    font.y = c(12, "bold.italic", "darkred"),
+                    font.tickslab = c(12, "plain", "darkgreen"),
+                    xlab = c("Time (days)"),
+                    tables.y.text =F,
+                    
+                    ncol=2)  %>% ggpar(font.main = c(12, "bold", "darkblue"),
+                                       font.x = c(12, "bold.italic", "darkred"),
+                                       font.y = c(12, "bold.italic", "darkred"),
+                                       font.legend = c(12, "plain", "black"))
+
+ggsave(filename =  paste("../output/", "NU_Reverse_TNC_cluster.png", sep = ""), 
+       device = "png", units = c("cm"), dpi = 300, width = 25, height = 40, plot = print( survp))
+
+
+# TNC HIGH CTL SPLIT
+fit <- survfit(Surv( times, vital_status ) ~ Project.ID + cluster2,
+               data = go_rev[ go_rev$cluster=="TNC High", ])
+survp <-  ggsurvplot(fit = fit, data = go_rev[ go_rev$cluster=="TNC High", ], 
+                     risk.table = T, 
+                     risk.table.height = 0.3,
+                     legend.labs = c("CTL High", "CTL Low"),
+                     palette = c("darkorange1", "seagreen4"),
+                     pval = TRUE, 
+                     pval.coord = c(6000, 0.9),
+                     ggtheme = theme_survminer(),
+                     #xlim=c(0,5000), #
+                     #break.x.by = 2000,
+                     title = c("TNC High & CTL Clustering"),
+                     font.main = c(12, "bold", "darkblue"),
+                     font.x = c(12, "bold.italic", "darkred"),
+                     font.y = c(12, "bold.italic", "darkred"),
+                     font.tickslab = c(12, "plain", "darkgreen"),
+                     xlab = c("Time (days)"),
+                     tables.y.text =F,
+                     
+                     facet.by = "Project.ID",
+                     ncol=2) %>% ggpar(font.main = c(12, "bold", "darkblue"),
+                                       font.x = c(12, "bold.italic", "darkred"),
+                                       font.y = c(12, "bold.italic", "darkred"),
+                                       font.legend = c(12, "plain", "black"))
+
+ggsave(filename =  paste("../output/", "NU_Reverse_Split_TNC_High.png", sep = ""),
+       device = "png", units = c("cm"), dpi = 300, width = 25, height = 40,
+       plot = print( survp))
+
+# TNC LOW CTL SPLIT
+fit <- survfit(Surv( times, vital_status ) ~ Project.ID + cluster2,
+               data = go_rev[ go_rev$cluster=="TNC Low", ])
+survp <-  ggsurvplot(fit = fit, data = go_rev[ go_rev$cluster=="TNC Low", ], 
+                     legend.labs = c("CTL High", "CTL Low"),
+                     palette = c("darkorange1", "seagreen4"),
+                     risk.table = T, 
+                     risk.table.height = 0.3,
+                     pval = TRUE, 
+                     pval.coord = c(6000, 0.9),
+                     ggtheme = theme_survminer(),
+                     #xlim=c(0,5000), #
+                     #break.x.by = 2000,
+                     title = c("TNC Low & TNC Clustering"),
+                     font.main = c(12, "bold", "darkblue"),
+                     font.x = c(12, "bold.italic", "darkred"),
+                     font.y = c(12, "bold.italic", "darkred"),
+                     font.tickslab = c(12, "plain", "darkgreen"),
+                     xlab = c("Time (days)"),
+                     tables.y.text =F,
+                     
+                     facet.by = "Project.ID",
+                     ncol=2) %>% ggpar(font.main = c(12, "bold", "darkblue"),
+                                       font.x = c(12, "bold.italic", "darkred"),
+                                       font.y = c(12, "bold.italic", "darkred"),
+                                       font.legend = c(12, "plain", "black"))
+
+ggsave(filename =  paste("../output/", "NU_Reverse_Split_TNC_Low.png", sep = ""),
+       device = "png", units = c("cm"), dpi = 300, width = 25, height = 40,
+       plot = print( survp))
+
+```
+
