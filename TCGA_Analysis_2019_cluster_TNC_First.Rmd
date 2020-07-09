@@ -7,7 +7,7 @@ output:
 
 ```{r setup, message=FALSE, warning=FALSE, results="hide"}
 
-setwd("~//TNC/2019_TNC_Reanalysis/bin")
+setwd("~/TNC/2019_TNC_Reanalysis/bin")
 
 library(survival)
 library(survminer)

@@ -9,7 +9,7 @@ output:
 
 ```{r setup, message=FALSE, warning=FALSE, echo=TRUE, include=TRUE}
 
-setwd("~/Dropbox/POSTDOC/BioInformatics_Projects/TNC/Microarray_Data/bin/")
+setwd("~/Microarray_Data/bin/")
 
 library(readxl)
 library(tidyverse)
