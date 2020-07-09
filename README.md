@@ -1,7 +1,8 @@
 # ImmuneRemodellingECM
 These are scripts that were used to make the figures in the paper:
 
-An Effective Anti-Tumour T Cell Response Remodels the Tumour Microenvironment Amplifying Immunity and Facilitating Loss of Tumour Initiating Cells
+An Effective Anti-Tumour T Cell Response Remodels the Tumour Microenvironment Amplifying Immunity and Facilitating Loss of Tumour Initiating Cells.
+
 Pires et al 2020
 
 The scripts deal with two areas:
