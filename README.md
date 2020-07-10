@@ -18,7 +18,7 @@ Analysis of TCGA data in 21 cancers to look at survival based on the expression 
 3. Survival is analysed across the groups.
 
 TCGA data can be downloaded from the GDC portal for the cancers specified (see code or manuscript).
-Microarray raw data can found at array express, accession number:
+Microarray raw and normalised data can found at array express, accession number:
 E-MTAB-9351
 
 
