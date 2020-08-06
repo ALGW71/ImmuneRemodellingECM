@@ -7,7 +7,7 @@ Pires et al 2020
 
 The scripts deal with two areas:
 
-Analyis of microarray data from murine fibrosarcoma tumours in mice which responder and do not responder to depletion of regulatory T cells.
+Analyis of microarray data from murine fibrosarcoma tumours in mice which respond and do not respond to depletion of regulatory T cells.
 1. Comparison using Limma to find differentially expressed genes (DEGs).
 2. Pathway analysis with Reactome on the sets of DEGs.
 3. Manhattan distance analysis to look for genes with most similar and most different (normalised) gene expression patterns to the gene of interest.
