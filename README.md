@@ -1,9 +1,9 @@
 # ImmuneRemodellingECM
 These are scripts that were used to make the figures in the paper:
 
-An Effective Anti-Tumour T Cell Response Remodels the Tumour Microenvironment Amplifying Immunity and Facilitating Loss of Tumour Initiating Cells.
-
+Immune Remodeling of the Extracellular Matrix Drives Loss of Cancer Stem Cells and Tumor Rejection
 Pires et al 2020
+https://cancerimmunolres.aacrjournals.org/content/canimm/early/2020/11/07/2326-6066.CIR-20-0070.full.pdf
 
 The scripts deal with two areas:
 
